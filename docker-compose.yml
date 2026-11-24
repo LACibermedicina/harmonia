@@ -1,0 +1,120 @@
+# harmonIA — stack de produção (harmonia.m3d.pro)
+# Regra de portas: nada < 1024 e nada já ocupado no host.
+#  - nginx: publicado SOMENTE em 127.0.0.1:${HTTP_PORT} (porta alta livre, escolhida pelo setup/deploy)
+#  - coturn: ${TURN_PORT} e relay ${TURN_MIN_PORT}-${TURN_MAX_PORT} (portas altas livres)
+#  - demais serviços: só na rede interna, sem nenhuma porta no host
+name: harmonia
+
+x-common: &common
+  restart: unless-stopped
+  env_file: .env
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "5" }
+
+services:
+  nginx:
+    <<: *common
+    build:
+      context: .
+      dockerfile: infra/nginx/Dockerfile   # build do frontend + nginx sem privilégios (escuta 8080)
+    ports: ["127.0.0.1:${HTTP_PORT:?rode infra/scripts/setup-vps.sh}:8080"]
+    volumes:
+      - ./infra/nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on: [api, realtime]
+    networks: [edge, internal]
+
+  api:
+    <<: *common
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      MEDIA_ROOT: /data/media
+      PUBLIC_BASE_URL: https://${SUBDOMINIO}
+      GIT_SHA: ${GIT_SHA:-dev}
+    volumes:
+      - ./data/media:/data/media
+      - ./data/status:/data/status:ro   # estado da atualização automática (painel Administração)
+      - ./data/ai:/data/ai              # acervo de credenciais de IA (coletar-ia.sh) + resultado dos testes
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    networks: [internal, egress]   # egress: tradução/assistente via API de IA
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 20s
+      retries: 5
+
+  ai-worker:
+    <<: *common
+    build:
+      context: ./ai-worker
+      args:
+        ML: ${AI_ML:-0}   # 0 = leve (sem PyTorch) · 1 = IA completa (≥ 8 GB RAM)
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      MEDIA_ROOT: /data/media
+      MODELS_DIR: /data/models
+    volumes:
+      - ./data/media:/data/media
+      - ./data/models:/data/models
+    depends_on: [redis]
+    networks: [internal, egress]   # egress: baixar modelos (Whisper/Demucs) na 1ª execução
+    deploy:
+      resources:
+        limits: { memory: "${AI_WORKER_MEM:-6g}" }
+
+  realtime:
+    <<: *common
+    build: ./realtime
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+    depends_on: [redis]
+    networks: [internal]
+
+  db:
+    <<: *common
+    image: postgres:16-alpine
+    volumes: ["./data/postgres:/var/lib/postgresql/data"]
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      retries: 10
+
+  redis:
+    <<: *common
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
+    volumes: ["./data/redis:/data"]
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_PASSWORD} ping | grep PONG"]
+      interval: 10s
+
+  coturn:
+    <<: *common
+    image: coturn/coturn:4.6
+    network_mode: host   # TURN precisa das portas UDP reais (todas altas e livres)
+    command: >
+      -n --realm=${SUBDOMINIO} --use-auth-secret --static-auth-secret=${TURN_SECRET}
+      --listening-port=${TURN_PORT:?rode setup-vps.sh} --min-port=${TURN_MIN_PORT} --max-port=${TURN_MAX_PORT}
+      --no-cli --no-tls --no-dtls --fingerprint --no-tcp-relay
+
+  # Opcional: publicação sem nenhuma porta de entrada (COMPOSE_PROFILES=tunnel)
+  cloudflared:
+    <<: *common
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on: [nginx]
+    networks: [edge]
+
+networks:
+  edge: {}
+  egress: {}
+  internal:
+    internal: true

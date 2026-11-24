@@ -1,0 +1,129 @@
+# harmonIA — CI/CD: testes + deploy automático na VPS via SSH a cada push na main
+name: ci-harmonia
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:      # Actions → ci-harmonia → Run workflow (reenvia as credenciais de IA)
+  schedule:
+    - cron: "17 6 * * *"  # sincroniza credenciais de IA diariamente
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  PROJETO_NOME: harmonia
+  APP_DIR: /opt/harmonia
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Testes do motor musical (ai-worker, núcleo puro)
+        working-directory: ai-worker
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install -r requirements-core.txt "numpy>=1.26,<2.3" pytest
+          python -m pytest -q tests
+      - name: Testes da API (FastAPI + SQLite + fakeredis)
+        working-directory: backend
+        run: |
+          pip install -r requirements.txt fakeredis pytest
+          python -m pytest -q tests
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build do frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+  # Envia as credenciais de IA dos secrets (SERVIDOR_ENV e/ou individuais) para o .env da VPS.
+  # Só chaves de IA da lista permitida; nunca falha o CI; nunca imprime valores.
+  sync-ai-env:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sincronizar credenciais de IA com a VPS
+        env:
+          SERVIDOR_ENV: ${{ secrets.SERVIDOR_ENV }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_MODELS_TOKEN }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GEMINI_FALLBACK_MODELS: ${{ vars.GEMINI_FALLBACK_MODELS }}
+          POLLINATIONS_MODEL: ${{ vars.POLLINATIONS_MODEL }}
+          AI_POLLINATIONS_ANON: ${{ vars.AI_POLLINATIONS_ANON }}
+          AI_PROVIDERS: ${{ vars.AI_PROVIDERS }}
+        run: bash infra/scripts/ci-sync-ai-env.sh
+
+  # Modo padrão é "pull": a VPS verifica o GitHub a cada 5 min e só aplica commits com este CI verde
+  # (infra/scripts/autoupdate.sh). Para deploy por push via SSH, crie a variável DEPLOY_MODE=push.
+  deploy:
+    needs: test
+    if: ${{ vars.DEPLOY_MODE == 'push' }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar chave SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sincronizar código (rsync, sem .env/dados)
+        run: |
+          rsync -az --delete \
+            --exclude '.git' --exclude '.env' --exclude 'data/' --exclude 'certbot/' \
+            --exclude 'node_modules' --exclude '__pycache__' \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            ./ "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ env.APP_DIR }}/"
+
+      - name: Build e restart da stack
+        run: |
+          ssh -i ~/.ssh/deploy_key "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            "cd ${{ env.APP_DIR }} && bash infra/scripts/deploy.sh ${{ github.sha }}"
+
+      - name: Health check interno (127.0.0.1:HTTP_PORT na VPS)
+        run: |
+          ssh -i ~/.ssh/deploy_key "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" '
+            cd ${{ env.APP_DIR }} && P=$(grep -E "^HTTP_PORT=" .env | cut -d= -f2)
+            for i in $(seq 1 40); do curl -fsS "http://127.0.0.1:$P/api/health" && exit 0; sleep 6; done; exit 1'
+
+      - name: Health check público (HTTPS via proxy do host)
+        run: |
+          for i in $(seq 1 10); do
+            if curl -fsS https://harmonia.m3d.pro/api/health; then exit 0; fi
+            sleep 6
+          done
+          echo "::warning::App ok internamente, mas https://harmonia.m3d.pro não responde — verifique o vhost do proxy/DNS (infra/host-proxy/README.md)"

@@ -1,0 +1,9 @@
+.env
+data/
+certbot/
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+media/
